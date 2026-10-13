@@ -107,21 +107,24 @@ export const createGoogleUserIdentity = async (
 
 
 
+
 /**
- * Create an authentication session using the same
- * transaction connection.
+ * ============================================================
+ * Create Google Authentication Session
+ * ============================================================
+ *
+ * Responsibilities:
+ * 1. Create an authentication session.
+ * 2. Insert the initial refresh-token hash into token history.
+ * 3. Mark the initial refresh token as ACTIVE.
  *
  * IMPORTANT:
- * This function does not create its own connection.
+ * Both records are inserted using the same transaction
+ * connection. If either insert fails, the caller's transaction
+ * should roll back both operations.
  *
- * The session is created in the same transaction as:
- *
- *   master_user
- *   auth_user_identity
- *   auth_session
- *
- * Therefore, if session creation fails, the complete
- * Google customer provisioning transaction can be rolled back.
+ * The plaintext refresh token is never stored in the database.
+ * ============================================================
  */
 export const createGoogleAuthSession = async (
   connection,
@@ -157,6 +160,30 @@ export const createGoogleAuthSession = async (
     expiresAt,
   }
 ) => {
+  // ----------------------------------------------------------
+  // STEP 1: Validate required authentication session data.
+  // ----------------------------------------------------------
+
+  if (!id || !sessionId || !userId || !expiresAt) {
+    throw new Error(
+      "Required Google authentication session data is missing."
+    );
+  }
+
+  // Only a valid 64-character SHA-256 hash is accepted.
+  if (
+    typeof refreshTokenHash !== "string" ||
+    !/^[a-f0-9]{64}$/i.test(refreshTokenHash)
+  ) {
+    throw new Error(
+      "A valid refresh-token SHA-256 hash is required."
+    );
+  }
+
+  // ----------------------------------------------------------
+  // STEP 2: Insert the authentication session.
+  // ----------------------------------------------------------
+
   await connection.execute(
     `
       INSERT INTO auth_session (
@@ -239,6 +266,43 @@ export const createGoogleAuthSession = async (
       expiresAt,
     ]
   );
+
+  // ----------------------------------------------------------
+  // STEP 3: Insert the initial refresh-token history record.
+  // ----------------------------------------------------------
+  //
+  // The initial token must be ACTIVE so that
+  // rotateRefreshTokenByHash() can rotate it successfully.
+  //
+  // Use the same session_id and hash as auth_session.
+  // ----------------------------------------------------------
+
+  await connection.execute(
+    `
+      INSERT INTO auth_refresh_token_history (
+        id,
+        session_id,
+        refresh_token_hash,
+        token_status,
+        created_at
+      )
+      VALUES (
+        UUID(),
+        ?,
+        ?,
+        'ACTIVE',
+        CURRENT_TIMESTAMP
+      )
+    `,
+    [
+      sessionId,
+      refreshTokenHash,
+    ]
+  );
+
+  // ----------------------------------------------------------
+  // STEP 4: Return the session information.
+  // ----------------------------------------------------------
 
   return {
     id,

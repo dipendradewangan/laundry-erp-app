@@ -4,42 +4,33 @@
  * ============================================================
  *
  * File:
- * -----
- * src/services/auth/googleAuthService.js
+ *   backend/src/services/auth/googleAuthService.js
  *
  * Responsibilities:
- * -----------------
- * 1. Verify Google ID tokens.
- * 2. Authenticate existing Google users.
- * 3. Register new Google users.
- * 4. Create authentication sessions.
- * 5. Prevent automatic account linking.
- * 6. Record Google authentication audit events.
+ *   1. Verify Google ID tokens.
+ *   2. Authenticate existing Google users.
+ *   3. Register new Google users.
+ *   4. Create authentication sessions.
+ *   5. Prevent automatic account linking.
+ *   6. Record Google authentication audit events.
  *
- * Database:
- * ---------
- * Business data:
- *   laundry_core
+ * Databases:
+ *   Core  : laundry_core
+ *   Audit : laundry_audit
  *
- * Audit data:
- *   laundry_audit
- *
- * Important:
- * ----------
- * - Google identity is verified by the backend.
- * - Google identity is never trusted directly from frontend data.
- * - Existing accounts are not automatically linked.
- * - Refresh tokens are stored as SHA-256 hashes in the database.
- * - Authentication credentials are never written to audit logs.
+ * Security:
+ *   - Verify Google credentials on the backend.
+ *   - Never trust identity details supplied by the frontend.
+ *   - Never automatically link existing local accounts.
+ *   - Store only refresh-token hashes in the database.
+ *   - Never write credentials or authentication tokens to audit.
  * ============================================================
  */
 
 import crypto from "node:crypto";
-
 import jwt from "jsonwebtoken";
 
 import { googleOAuthClient } from "../../config/googleAuth.js";
-
 import { executeTransaction } from "../../config/databaseTransaction.js";
 
 import {
@@ -66,16 +57,6 @@ import {
  * ============================================================
  * 1. Verify Google Identity
  * ============================================================
- *
- * Google ID token verify karta hai.
- *
- * Verification includes:
- * - Token signature
- * - Token audience
- * - Token validity
- *
- * @param {string} googleIdToken
- * @returns {Promise<Object>}
  */
 export const verifyGoogleIdentity = async (googleIdToken) => {
   if (
@@ -83,6 +64,10 @@ export const verifyGoogleIdentity = async (googleIdToken) => {
     !googleIdToken.trim()
   ) {
     throw new Error("Google ID token is required.");
+  }
+
+  if (!process.env.GOOGLE_CLIENT_ID) {
+    throw new Error("GOOGLE_CLIENT_ID is not configured.");
   }
 
   const ticket = await googleOAuthClient.verifyIdToken({
@@ -98,15 +83,10 @@ export const verifyGoogleIdentity = async (googleIdToken) => {
 
   return {
     providerUserId: payload.sub,
-
     providerEmail: payload.email || null,
-
     emailVerified: payload.email_verified === true,
-
     firstName: payload.given_name || null,
-
     lastName: payload.family_name || null,
-
     picture: payload.picture || null,
   };
 };
@@ -114,21 +94,8 @@ export const verifyGoogleIdentity = async (googleIdToken) => {
 
 /**
  * ============================================================
- * 2. Generate Google Authentication Session
+ * 2. Generate Google Authentication Session Data
  * ============================================================
- *
- * Creates:
- * - Database session ID
- * - Public session ID
- * - Refresh token
- * - Refresh token SHA-256 hash
- * - Access JWT
- *
- * The plaintext refresh token is returned to the client.
- * Only its SHA-256 hash is persisted in the database.
- *
- * @param {Object} sessionData
- * @returns {Object}
  */
 const generateGoogleSessionData = ({
   userId,
@@ -166,27 +133,27 @@ const generateGoogleSessionData = ({
     throw new Error("JWT_ACCESS_SECRET is not configured.");
   }
 
-  // Internal primary key for auth_session.
+  // Internal auth_session primary key.
   const id = crypto.randomUUID();
 
-  // Public session identifier used in the access JWT.
+  // Public session ID used in the access JWT.
   const sessionId = crypto.randomUUID();
 
-  // Generate a cryptographically secure refresh token.
+  // Generate a secure refresh token.
   const refreshToken = crypto.randomBytes(64).toString("hex");
 
-  // Persist only the SHA-256 hash of the refresh token.
+  // Store only the SHA-256 hash in the database.
   const refreshTokenHash = crypto
     .createHash("sha256")
     .update(refreshToken)
     .digest("hex");
 
-  // Refresh session validity: 30 days.
+  // Fixed refresh-token lifetime: 30 days.
   const expiresAt = new Date(
     Date.now() + 30 * 24 * 60 * 60 * 1000,
   );
 
-  // Generate a short-lived access token.
+  // Generate a short-lived access JWT.
   const accessToken = jwt.sign(
     {
       sub: userId,
@@ -239,18 +206,10 @@ const generateGoogleSessionData = ({
 
 /**
  * ============================================================
- * 3. Create Authentication Session Record
+ * 3. Persist Authentication Session
  * ============================================================
  *
- * Common repository call for creating an authentication session.
- *
- * This helper does not start a transaction itself.
- * The caller supplies the active transaction connection.
- *
- * @param {Object} connection
- * @param {Object} sessionData
- * @param {string} userId
- * @returns {Promise<Object>}
+ * The caller supplies the active core DB transaction.
  */
 const persistGoogleSession = async (
   connection,
@@ -259,9 +218,7 @@ const persistGoogleSession = async (
 ) => {
   return createGoogleAuthSession(connection, {
     id: sessionData.id,
-
     sessionId: sessionData.sessionId,
-
     userId,
 
     refreshTokenHash: sessionData.refreshTokenHash,
@@ -296,21 +253,8 @@ const persistGoogleSession = async (
 
 /**
  * ============================================================
- * 4. Record Google Authentication Audit Event
+ * 4. Google Authentication Audit Helper
  * ============================================================
- *
- * Reusable audit helper.
- *
- * The audit repository uses a separate connection to
- * laundry_audit.
- *
- * IMPORTANT:
- * ----------
- * Do not add passwords, Google credentials, access tokens,
- * refresh tokens, or their hashes to this payload.
- *
- * @param {Object} params
- * @returns {Promise<Object>}
  */
 const recordGoogleAudit = async ({
   action,
@@ -351,7 +295,6 @@ const recordGoogleAudit = async ({
 }) => {
   return recordAuditEvent({
     action,
-
     module: "AUTH",
 
     entity,
@@ -396,66 +339,34 @@ const recordGoogleAudit = async ({
  * ============================================================
  * 5. Login With Google
  * ============================================================
- *
- * Scenarios:
- *
- * A. Existing Google identity:
- *    - Create a new session.
- *    - Record LOGIN audit event.
- *
- * B. Existing local account:
- *    - Do not automatically link Google.
- *    - Return ACCOUNT_LINKING_REQUIRED.
- *
- * C. New Google user:
- *    - Create user.
- *    - Create Google identity.
- *    - Create session.
- *    - Record REGISTER audit event.
- *
- * D. Invalid or rejected Google identity:
- *    - Return an appropriate failure reason.
- *    - Record a corresponding audit event where applicable.
- *
- * @param {Object} params
- * @returns {Promise<Object>}
  */
 export const loginWithGoogle = async ({
   googleCredential,
 
-  // Device information.
   deviceId = null,
   deviceType = null,
   deviceManufacturer = null,
   deviceModel = null,
 
-  // Operating system.
   osName = null,
   osVersion = null,
 
-  // Browser.
   browserName = null,
   browserVersion = null,
 
-  // Screen.
   screenWidth = null,
   screenHeight = null,
   pixelRatio = null,
 
-  // Network.
   userAgent = null,
   ipAddress = null,
   forwardedFor = null,
 
-  // Location.
   latitude = null,
   longitude = null,
   locationAccuracy = null,
 }) => {
-  /**
-   * Collect metadata once so the same information can be used
-   * for successful and rejected authentication events.
-   */
+  // Collect request metadata once for audit events.
   const requestMetadata = {
     deviceId,
     deviceType,
@@ -481,11 +392,11 @@ export const loginWithGoogle = async ({
     locationAccuracy,
   };
 
-  /**
-   * ----------------------------------------------------------
-   * STEP 1: Validate Google credential
-   * ----------------------------------------------------------
-   */
+
+  // ----------------------------------------------------------
+  // STEP 1: Validate the Google credential.
+  // ----------------------------------------------------------
+
   if (
     typeof googleCredential !== "string" ||
     !googleCredential.trim()
@@ -493,7 +404,6 @@ export const loginWithGoogle = async ({
     await recordGoogleAudit({
       action: "LOGIN_FAILED",
       status: "FAILED",
-      attemptedIdentity: null,
       failureReason: "GOOGLE_CREDENTIAL_REQUIRED",
       metadata: {
         provider: "GOOGLE",
@@ -507,38 +417,29 @@ export const loginWithGoogle = async ({
     };
   }
 
-  /**
-   * ----------------------------------------------------------
-   * STEP 2: Verify Google identity
-   * ----------------------------------------------------------
-   *
-   * Google token verification errors are handled by the
-   * controller's error handler.
-   *
-   * The raw credential is never written to the audit log.
-   */
+
+  // ----------------------------------------------------------
+  // STEP 2: Verify the Google ID token.
+  // ----------------------------------------------------------
+
   const googleIdentity = await verifyGoogleIdentity(
     googleCredential,
   );
 
-  /**
-   * ----------------------------------------------------------
-   * STEP 3: Require verified Google email
-   * ----------------------------------------------------------
-   */
+
+  // ----------------------------------------------------------
+  // STEP 3: Require a verified Google email.
+  // ----------------------------------------------------------
+
   if (!googleIdentity.emailVerified) {
     await recordGoogleAudit({
       action: "LOGIN_FAILED",
       status: "DENIED",
-
       attemptedIdentity: googleIdentity.providerEmail,
-
       failureReason: "GOOGLE_EMAIL_NOT_VERIFIED",
-
       metadata: {
         provider: "GOOGLE",
       },
-
       ...requestMetadata,
     });
 
@@ -548,22 +449,19 @@ export const loginWithGoogle = async ({
     };
   }
 
-  /**
-   * ----------------------------------------------------------
-   * STEP 4: Require Google email
-   * ----------------------------------------------------------
-   */
+
+  // ----------------------------------------------------------
+  // STEP 4: Require an available Google email.
+  // ----------------------------------------------------------
+
   if (!googleIdentity.providerEmail) {
     await recordGoogleAudit({
       action: "LOGIN_FAILED",
       status: "DENIED",
-
       failureReason: "GOOGLE_EMAIL_NOT_AVAILABLE",
-
       metadata: {
         provider: "GOOGLE",
       },
-
       ...requestMetadata,
     });
 
@@ -573,44 +471,34 @@ export const loginWithGoogle = async ({
     };
   }
 
-  /**
-   * ----------------------------------------------------------
-   * STEP 5: Find existing Google identity
-   * ----------------------------------------------------------
-   */
+
+  // ----------------------------------------------------------
+  // STEP 5: Find an existing Google identity.
+  // ----------------------------------------------------------
+
   const existingIdentity = await findUserIdentity({
     provider: "GOOGLE",
     providerUserId: googleIdentity.providerUserId,
   });
 
-  /**
-   * ==========================================================
-   * CASE A: Existing Google identity
-   * ==========================================================
-   */
+
+  // ==========================================================
+  // CASE A: Existing Google identity.
+  // ==========================================================
+
   if (existingIdentity) {
-    /**
-     * Reject disabled Google identities.
-     */
-    // --------------------------------------------------------
-    // STEP A: Check whether the Google identity is enabled.
-    // --------------------------------------------------------
+    // STEP A1: Reject a disabled Google identity.
 
     if (!existingIdentity.is_active) {
       await recordGoogleAudit({
         action: "LOGIN_FAILED",
         status: "DENIED",
-
         userId: existingIdentity.user_id,
-
         attemptedIdentity: googleIdentity.providerEmail,
-
         failureReason: "GOOGLE_IDENTITY_DISABLED",
-
         metadata: {
           provider: "GOOGLE",
         },
-
         ...requestMetadata,
       });
 
@@ -620,33 +508,26 @@ export const loginWithGoogle = async ({
       };
     }
 
-    // --------------------------------------------------------
-    // STEP B: Retrieve the linked user's current account status.
-    // --------------------------------------------------------
+
+    // STEP A2: Load the linked user.
 
     const linkedUser = await findUserForGoogleAuthentication(
       existingIdentity.user_id,
     );
 
-    // --------------------------------------------------------
-    // STEP C: Reject missing or deleted accounts.
-    // --------------------------------------------------------
+
+    // STEP A3: Reject a missing or deleted user.
 
     if (!linkedUser) {
       await recordGoogleAudit({
         action: "LOGIN_FAILED",
         status: "DENIED",
-
         userId: existingIdentity.user_id,
-
         attemptedIdentity: googleIdentity.providerEmail,
-
         failureReason: "USER_ACCOUNT_NOT_FOUND",
-
         metadata: {
           provider: "GOOGLE",
         },
-
         ...requestMetadata,
       });
 
@@ -656,25 +537,19 @@ export const loginWithGoogle = async ({
       };
     }
 
-    // --------------------------------------------------------
-    // STEP D: Reject inactive user accounts.
-    // --------------------------------------------------------
+
+    // STEP A4: Reject an inactive account.
 
     if (!linkedUser.is_active) {
       await recordGoogleAudit({
         action: "LOGIN_FAILED",
         status: "DENIED",
-
         userId: linkedUser.id,
-
         attemptedIdentity: googleIdentity.providerEmail,
-
         failureReason: "USER_ACCOUNT_INACTIVE",
-
         metadata: {
           provider: "GOOGLE",
         },
-
         ...requestMetadata,
       });
 
@@ -684,25 +559,19 @@ export const loginWithGoogle = async ({
       };
     }
 
-    // --------------------------------------------------------
-    // STEP E: Reject users whose login has been disabled.
-    // --------------------------------------------------------
+
+    // STEP A5: Reject accounts where login is disabled.
 
     if (!linkedUser.is_login_enabled) {
       await recordGoogleAudit({
         action: "LOGIN_FAILED",
         status: "DENIED",
-
         userId: linkedUser.id,
-
         attemptedIdentity: googleIdentity.providerEmail,
-
         failureReason: "USER_LOGIN_DISABLED",
-
         metadata: {
           provider: "GOOGLE",
         },
-
         ...requestMetadata,
       });
 
@@ -712,9 +581,8 @@ export const loginWithGoogle = async ({
       };
     }
 
-    // --------------------------------------------------------
-    // STEP F: Reject accounts that are still locked.
-    // --------------------------------------------------------
+
+    // STEP A6: Reject an account that is still locked.
 
     if (
       linkedUser.locked_until &&
@@ -723,18 +591,13 @@ export const loginWithGoogle = async ({
       await recordGoogleAudit({
         action: "LOGIN_FAILED",
         status: "BLOCKED",
-
         userId: linkedUser.id,
-
         attemptedIdentity: googleIdentity.providerEmail,
-
         failureReason: "USER_ACCOUNT_LOCKED",
-
         metadata: {
           provider: "GOOGLE",
           lockedUntil: linkedUser.locked_until,
         },
-
         ...requestMetadata,
       });
 
@@ -744,25 +607,23 @@ export const loginWithGoogle = async ({
       };
     }
 
-    /**
-     * Generate session data for the existing user.
-     */
+
+    // STEP A7: Generate session data for the linked user.
+
     const sessionData = generateGoogleSessionData({
-      userId: existingIdentity.user_id,
+      userId: linkedUser.id,
       ...requestMetadata,
     });
 
-    /**
-     * Create the session in the core database transaction.
-     *
-     * User and Google identity are not recreated.
-     */
+
+    // STEP A8: Persist the session in the core database.
+
     const transactionResult = await executeTransaction(
       async (connection) => {
         const session = await persistGoogleSession(
           connection,
           sessionData,
-          existingIdentity.user_id,
+          linkedUser.id,
         );
 
         return {
@@ -771,18 +632,14 @@ export const loginWithGoogle = async ({
       },
     );
 
-    /**
-     * Record successful Google login.
-     *
-     * This audit write occurs after the core transaction
-     * has committed.
-     */
+
+    // STEP A9: Record the successful login.
+
     await recordGoogleAudit({
       action: "LOGIN",
       status: "SUCCESS",
 
-      userId: existingIdentity.user_id,
-
+      userId: linkedUser.id,
       sessionId: sessionData.sessionId,
 
       attemptedIdentity: googleIdentity.providerEmail,
@@ -798,20 +655,40 @@ export const loginWithGoogle = async ({
       ...requestMetadata,
     });
 
+
+    // STEP A10: Return the linked user's details and tokens.
+
     return {
       success: true,
-
       status: "EXISTING_IDENTITY",
 
-      userId: existingIdentity.user_id,
+      userId: linkedUser.id,
+
+      user: {
+        id: linkedUser.id,
+        email: linkedUser.email ?? null,
+        phone: linkedUser.phone ?? null,
+
+        firstName:
+          linkedUser.first_name ??
+          linkedUser.firstName ??
+          null,
+
+        middleName:
+          linkedUser.middle_name ??
+          linkedUser.middleName ??
+          null,
+
+        lastName:
+          linkedUser.last_name ??
+          linkedUser.lastName ??
+          null,
+      },
 
       identity: {
         provider: "GOOGLE",
-
         providerUserId: googleIdentity.providerUserId,
-
         providerEmail: googleIdentity.providerEmail,
-
         emailVerified: googleIdentity.emailVerified,
       },
 
@@ -821,38 +698,37 @@ export const loginWithGoogle = async ({
       },
 
       accessToken: sessionData.accessToken,
-
       refreshToken: sessionData.refreshToken,
     };
   }
 
-  /**
-   * ==========================================================
-   * CASE B: Google identity does not exist
-   * ==========================================================
-   *
-   * Check whether an active local account already uses
-   * this email address.
-   */
+
+  // ==========================================================
+  // CASE B: No Google identity exists.
+  // ==========================================================
+
+  // Check whether a local account already uses this email.
+
   const existingUser = await findActiveUserByEmail(
     googleIdentity.providerEmail,
   );
 
-  /**
-   * ==========================================================
-   * CASE B1: Existing local account
-   * ==========================================================
-   *
-   * Do not automatically link the Google identity.
-   * Explicit account linking must be implemented separately.
-   */
+
+  // ----------------------------------------------------------
+  // CASE B1: Existing local account.
+  // ----------------------------------------------------------
+  //
+  // Never automatically link a Google identity to a local
+  // account. Explicit account linking must be implemented
+  // as a separate authenticated workflow.
+  // ----------------------------------------------------------
+
   if (existingUser) {
     await recordGoogleAudit({
       action: "ACCOUNT_LINKING_REQUIRED",
       status: "DENIED",
 
       userId: existingUser.id,
-
       attemptedIdentity: googleIdentity.providerEmail,
 
       entity: "master_user",
@@ -870,87 +746,80 @@ export const loginWithGoogle = async ({
 
     return {
       success: false,
-
       reason: "ACCOUNT_LINKING_REQUIRED",
 
       userId: existingUser.id,
 
       identity: {
         provider: "GOOGLE",
-
         providerUserId: googleIdentity.providerUserId,
-
         providerEmail: googleIdentity.providerEmail,
-
         emailVerified: googleIdentity.emailVerified,
       },
     };
   }
 
-  /**
-   * ==========================================================
-   * CASE C: Completely new Google user
-   * ==========================================================
-   *
-   * All core database operations execute in one transaction:
-   *
-   * 1. Create customer.
-   * 2. Create Google identity.
-   * 3. Generate session data.
-   * 4. Create authentication session.
-   *
-   * The transaction commits only when all operations succeed.
-   */
+
+  // ==========================================================
+  // CASE C: Completely new Google user.
+  // ==========================================================
+  //
+  // All core database operations are executed in one
+  // transaction:
+  //
+  // 1. Create the user.
+  // 2. Create the Google identity.
+  // 3. Generate authentication session data.
+  // 4. Create the authentication session.
+  //
+  // If any operation fails, the transaction should roll back.
+  // ==========================================================
+
   const transactionResult = await executeTransaction(
     async (connection) => {
-      /**
-       * STEP C1: Create local customer.
-       */
+      // STEP C1: Create the local user.
+
       const customer = await createCustomerUser(
         connection,
         {
           email: googleIdentity.providerEmail,
-
           firstName: googleIdentity.firstName,
-
           lastName: googleIdentity.lastName,
         },
       );
 
-      /**
-       * STEP C2: Create Google identity.
-       */
+
+      // STEP C2: Create the Google identity.
+
       const identity = await createGoogleUserIdentity(
         connection,
         {
           userId: customer.id,
-
           providerUserId: googleIdentity.providerUserId,
-
           providerEmail: googleIdentity.providerEmail,
         },
       );
 
-      /**
-       * STEP C3: Generate authentication session data.
-       */
+
+      // STEP C3: Generate authentication session data.
+
       const sessionData = generateGoogleSessionData({
         userId: customer.id,
         ...requestMetadata,
       });
 
-      /**
-       * STEP C4: Create authentication session.
-       */
+
+      // STEP C4: Persist the session.
+
       const session = await persistGoogleSession(
         connection,
         sessionData,
         customer.id,
       );
 
-      /**
-       * Return transaction results.
-       */
+
+      // Return all required transaction results.
+
       return {
         customer,
         identity,
@@ -960,17 +829,11 @@ export const loginWithGoogle = async ({
     },
   );
 
-  /**
-   * ----------------------------------------------------------
-   * STEP C5: Record successful registration
-   * ----------------------------------------------------------
-   *
-   * This event is written only after the core transaction
-   * completes successfully.
-   *
-   * Never include the Google credential or authentication
-   * tokens in the audit payload.
-   */
+
+  // ----------------------------------------------------------
+  // STEP C5: Record successful registration.
+  // ----------------------------------------------------------
+
   await recordGoogleAudit({
     action: "REGISTER",
     status: "SUCCESS",
@@ -993,26 +856,31 @@ export const loginWithGoogle = async ({
     ...requestMetadata,
   });
 
-  /**
-   * ----------------------------------------------------------
-   * STEP C6: Return registration response
-   * ----------------------------------------------------------
-   */
+
+  // ----------------------------------------------------------
+  // STEP C6: Return the newly registered user.
+  // ----------------------------------------------------------
+
   return {
     success: true,
-
     status: "NEW_GOOGLE_USER",
+
+    userId: transactionResult.customer.id,
 
     user: {
       id: transactionResult.customer.id,
+      email: transactionResult.customer.email ?? null,
+      phone: transactionResult.customer.phone ?? null,
 
-      email: transactionResult.customer.email,
+      firstName:
+        transactionResult.customer.firstName ??
+        transactionResult.customer.first_name ??
+        null,
 
-      phone: transactionResult.customer.phone,
-
-      firstName: transactionResult.customer.firstName,
-
-      lastName: transactionResult.customer.lastName,
+      lastName:
+        transactionResult.customer.lastName ??
+        transactionResult.customer.last_name ??
+        null,
     },
 
     identity: {
@@ -1028,17 +896,11 @@ export const loginWithGoogle = async ({
     },
 
     session: {
-      sessionId:
-        transactionResult.session.sessionId,
-
-      expiresAt:
-        transactionResult.sessionData.expiresAt,
+      sessionId: transactionResult.session.sessionId,
+      expiresAt: transactionResult.sessionData.expiresAt,
     },
 
-    accessToken:
-      transactionResult.sessionData.accessToken,
-
-    refreshToken:
-      transactionResult.sessionData.refreshToken,
+    accessToken: transactionResult.sessionData.accessToken,
+    refreshToken: transactionResult.sessionData.refreshToken,
   };
 };
